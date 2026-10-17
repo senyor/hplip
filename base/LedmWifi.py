@@ -424,8 +424,14 @@ def associate(dev, adapterName, ssid, communication_mode, encryption_type, key):
         authMode,binascii.hexlify(to_bytes_utf8(key)).decode('utf-8'))        
 
     code = writeXmlDataToURI(dev,URI,ppXml,60)
+    # Some legacy LaserJets advertise WPA2 in scan results but require the
+    # WPA_PSK personal-security profile enum. Retry only on an explicit 400;
+    # retain the existing AESOrTKIP / autoWPA negotiation and credentials.
+    if code == 400 and encryption_type.upper() in ('WPA', 'WPA2'):
+        return associate(dev, adapterName, ssid, communication_mode, 'WPA_PSK', key)
+
     ret['errorreturn'] = code
-    if not(code == HTTP_OK or HTTP_NOCONTENT):
+    if code not in (HTTP_OK, HTTP_NOCONTENT):
         log.error("Request Failed With Response Code %d" % ret['errorreturn'])
     
     return ret
@@ -517,6 +523,53 @@ def getSignalStrength(dev, adapterName, ssid, adaptor_id=0):
     return  ss_max, ss_min, ss_val, ss_dbm
 
 
+def _http_response_complete(data):
+    """Recognize a fully framed HTTP response without exposing its payload."""
+    header, sep, body = data.partition(b'\r\n\r\n')
+    if not sep:
+        return False
+    headers = {}
+    for line in header.split(b'\r\n')[1:]:
+        key, colon, value = line.partition(b':')
+        if colon:
+            headers[key.lower().strip()] = value.strip().lower()
+    if b'chunked' in headers.get(b'transfer-encoding', b''):
+        offset = 0
+        try:
+            while True:
+                end = body.find(b'\r\n', offset)
+                if end < 0:
+                    return False
+                size = int(body[offset:end].split(b';')[0], 16)
+                offset = end + 2
+                if size == 0:
+                    return (body[offset:offset+2] == b'\r\n' or
+                            b'\r\n\r\n' in body[offset:])
+                if len(body) < offset + size + 2:
+                    return False
+                if body[offset+size:offset+size+2] != b'\r\n':
+                    return False
+                offset += size + 2
+        except ValueError:
+            return False
+    if b'content-length' in headers:
+        try:
+            return len(body) >= int(headers[b'content-length'])
+        except ValueError:
+            return False
+    return False
+
+
+def _read_marvell_response(dev, response, timeout=60):
+    """Stop at the HTTP message boundary, even if the USB channel stays open."""
+    deadline = time.monotonic() + timeout
+    while not _http_response_complete(response.getvalue()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Error(ERROR_DEVICE_IO_ERROR)
+        if not dev.readMarvell_EWS(1024, response, max(1, int(remaining))):
+            break
+
 def readXmlTagDataFromURI(dev,URI,xmlRootNode,xmlReqDataNode,timeout=60):
     paramsList,code =[],HTTP_ERROR
     
@@ -530,8 +583,7 @@ def readXmlTagDataFromURI(dev,URI,xmlRootNode,xmlReqDataNode,timeout=60):
             dev.openMarvell_EWS()
             dev.writeMarvell_EWS(data)
             try:
-                while dev.readMarvell_EWS(1024, response, timeout):
-                    pass
+                _read_marvell_response(dev, response, timeout)
             except Error:
                 dev.closeMarvell_EWS()
                 log.error("Unable to read Marvell_EWS Channel")
@@ -591,8 +643,7 @@ def readXmlDataFromURI(dev,URI,xmlRootNode,xmlChildNode,timeout=60):
             dev.openMarvell_EWS()
             dev.writeMarvell_EWS(data)
             try:
-                while dev.readMarvell_EWS(1024, response, timeout):
-                    pass
+                _read_marvell_response(dev, response, timeout)
             except Error:
                 dev.closeMarvell_EWS()
                 log.error("Unable to read Marvell_EWS Channel")
@@ -643,8 +694,7 @@ def writeXmlDataToURI(dev,URI,xml,timeout=60):
             dev.openMarvell_EWS()
             dev.writeMarvell_EWS(data)
             try:
-               while dev.readMarvell_EWS(1000, response, timeout):
-                   pass
+               _read_marvell_response(dev, response, timeout)
             except Error:
                 dev.closeMarvell_EWS()
                 log.error("Unable to read Marvell_EWS Channel")
